@@ -1,8 +1,8 @@
-from fastapi.applications import FastAPI
-from fastapi import FastAPI, HTTPException
 import os
 import uuid
 from typing import Dict, List, Optional
+from fastapi.applications import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from dotenv import load_dotenv
@@ -17,6 +17,13 @@ import re
 load_dotenv()
 
 app: FastAPI = FastAPI(title="AI Interviewer API ", description="", version="1.0.0", redoc_url=None)
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is missing in environment variables.")
+
+parser = StrOutputParser()
+
 
 #Prompts
 # Generate questions based on role and experience
@@ -44,21 +51,61 @@ Return ONLY a JSON array of 5 questions, no explanations:
 """
 )
 
+# Evaluate each answer
+EVALUATE_ANSWER_PROMPT = ChatPromptTemplate.from_template("""
+You are an expert technical interviewer evaluating a candidate's answer.
+
+Job Role: {job_role}
+Experience Level: {experience} years
+Question: {question}
+Candidate's Answer: {answer}
+
+Provide a detailed evaluation including:
+1. Technical accuracy (1-10)
+2. Completeness of answer (1-10)
+3. Clarity of explanation (1-10)
+4. Specific feedback and suggestions
+5. Overall score (1-10)
+
+Format your response as:
+Score: X/10
+Technical Accuracy: X/10
+Completeness: X/10
+Clarity: X/10
+Feedback: [Your detailed feedback here]
+""")
+
+FINAL_REPORT_PROMPT = ChatPromptTemplate.from_template("""
+You are an expert technical interviewer creating a comprehensive interview report.
+
+Job Role: {job_role}
+Experience Level: {experience} years
+
+Interview Results:
+{interview_results}
+
+Create a professional final report including:
+1. Overall assessment
+2. Strengths identified
+3. Areas for improvement
+4. Technical competency score (average of all scores)
+5. Recommendation (Pass/Fail/Consider with conditions)
+6. Detailed breakdown of each question
+
+Format as a professional report.
+""")
+
 
 # LLM 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is missing in environment variables.")
-
 
 llm = ChatGoogleGenerativeAI(
     model = "gemini-2.0-flash",
-    api_key = GEMINI_API_KEY
+    api_key = GEMINI_API_KEY,
+    temperature=0.7
 )
 # response = llm.invoke("Who is Mahatma Gandhi")
 # print(response.content)
 
-parser = StrOutputParser()
 
 def extract_json(raw):
     # Try vanilla JSON parsing first
@@ -90,11 +137,35 @@ def generate_questions(job_role: str, experience: int):
         raise HTTPException(status_code=502, detail="LLM did not generate exactly 5 questions.")
     return questions
 
+def evaluate_answer(job_role:str, experience:int, question:str, answer:str):
+    chain = EVALUATE_ANSWER_PROMPT | llm | parser
+    feedback = chain.invoke({"job_role":job_role, "experience":experience, "question":question, "answer":question})
+    return feedback
+
+def build_final_report(job_role: str, experience:int,data:List[dict] ) :
+    
+    interview_results = []
+    for i, row in enumerate(data, start=1):
+        interview_results.append(
+            f"Question {i}: {row.get('question', "")}\n"
+            f"Answer: {row.get('answer', "")}\n"
+            f"Feedback : {row.get('feedback', "")}\n"
+            + ("-"*40)
+        )
+    results_blob = "\n".join(interview_results)    
+    chain = FINAL_REPORT_PROMPT | llm | parser
+    final_report = chain.invoke({"job_role": job_role, "experience": experience, "interview_results": results_blob})
+    return final_report
+
 
 #Models
 class CreateSessionRequest(BaseModel):
     job_role: str = Field(..., example="React Developer")
     experience: int = Field(..., ge=0, le=50, example=2)
+
+class SubmitAnswerRequest(BaseModel):
+    answer: str 
+
 
 class CreateSessionResponse(BaseModel):
     session_id: str
@@ -102,12 +173,21 @@ class CreateSessionResponse(BaseModel):
     experience: int
     questions:List[str]
     current_question_idx : int
+class SubmitAnswerResponse(BaseModel):
+    question_idx: int
+    question: str
+    feedback: str
+    next_question_idx: Optional[int] = None
+    next_question: Optional[str] = None
+
 
 class SessionState(BaseModel):
     job_role: str
     experience: int
     data : List[Dict]
     current_question_idx : int
+    final_report: Optional[str] = None
+
 
 
 sessions: Dict[str, SessionState] = {}
@@ -130,7 +210,8 @@ def create_session(payload: CreateSessionRequest):
         job_role= payload.job_role,
         experience= payload.experience,
         data = [{"question": q, "answer": "", "feedback": ""} for q in questions],
-        current_question_idx = 0
+        current_question_idx = 0,
+        
     )
     sessions[sid] = state
     return CreateSessionResponse(
@@ -146,3 +227,49 @@ def get_session(session_id:str):
    state = sessions.get(session_id)
    return state
 
+
+@app.post("/sessions/{session_id}/answers", response_model=SubmitAnswerResponse)
+def submit_answer(session_id:str, payload:SubmitAnswerRequest):
+    state = sessions.get(session_id)
+    idx = state.current_question_idx
+    if idx >= 5:
+      raise HTTPException(status_code=400, detail="All questions already answered")
+    question = state.data[idx]['question']
+    # Save the answer
+    state.data[idx]['answer']= payload.answer.strip()
+    # Evaluate
+    feedback = evaluate_answer(state.job_role, state.experience, question, state.data[idx]['answer'])
+    state.data[idx]['feedback'] = feedback
+
+    # Move index
+    state.current_question_idx +=1
+
+    # Set next question info
+    next_q_idx = None
+    next_q = None
+    if state.current_question_idx < 5 :
+        next_q_idx = state.current_question_idx
+        next_q = state.data[next_q_idx]['question']
+    else:
+        state.final_report =  build_final_report(state.job_role, state.experience, state.data)   
+
+    sessions[session_id] = state   
+    
+    return SubmitAnswerResponse(
+        question_idx=idx,
+        question=question,
+        feedback=feedback,
+        next_question_idx=next_q_idx,
+        next_question=next_q,
+    ) 
+
+
+
+@app.get("/sessions/{session_id}/report")
+def get_report(session_id:str):
+    state = sessions.get(session_id)
+    return {
+        "job_role": state.job_role,
+        "experience":   state.experience,
+        "final_report": state.final_report
+    }
